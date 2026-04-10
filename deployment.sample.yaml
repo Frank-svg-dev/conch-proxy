@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: conch-proxy
+  labels:
+    app: conch-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: conch-proxy
+  template:
+    metadata:
+      labels:
+        app: conch-proxy
+    spec:
+      containers:
+        - name: conch-proxy
+          image: your-registry/conch-proxy:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: PORT
+              value: "8080"
+            - name: UPSTREAM_API_URL
+              value: "https://api.openai.com/v1"
+            - name: UPSTREAM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: conch-proxy-secrets
+                  key: upstream-api-key
+            - name: SLM_API_URL
+              value: "https://api.openai.com/v1"
+            - name: SLM_MODEL
+              value: "gpt-4.1-mini"
+            - name: SLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: conch-proxy-secrets
+                  key: slm-api-key
+            - name: PROXY_URL
+              value: ""
+            - name: ENABLE_INTERCEPTOR
+              value: "true"
+            - name: SENSITIVE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: conch-proxy-secrets
+                  key: sensitive-token
+            - name: UNLOCK_TTL_MINUTES
+              value: "60"
+            - name: ENABLE_TLS
+              value: "false"
+            - name: TLS_CERT_FILE
+              value: "/app/server.crt"
+            - name: TLS_KEY_FILE
+              value: "/app/server.key"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: conch-proxy
+  labels:
+    app: conch-proxy
+spec:
+  selector:
+    app: conch-proxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: conch-proxy-secrets
+type: Opaque
+stringData:
+  upstream-api-key: "<YOUR_UPSTREAM_API_KEY>"
+  slm-api-key: "<YOUR_SLM_API_KEY>"
+  sensitive-token: "<YOUR_SENSITIVE_TOKEN>"

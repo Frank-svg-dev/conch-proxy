@@ -1,0 +1,488 @@
+package processor
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"math/rand"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Frank-svg-dev/conch-proxy/internal/agent"
+	configv1 "github.com/Frank-svg-dev/conch-proxy/internal/config"
+	"github.com/go-kratos/blades"
+	"github.com/go-kratos/blades/contrib/openai"
+)
+
+type SentenceProcessor struct {
+	fullResponse      strings.Builder
+	reasoningBuffer   strings.Builder
+	toolCallsBuffer   strings.Builder
+	toolCallsMap      map[int]map[string]interface{}
+	sentencePattern   *regexp.Regexp
+	agent             blades.Agent
+	modelProvider     blades.ModelProvider
+	mu                sync.Mutex
+	enableInterceptor bool
+	responseComplete  bool
+	sendSingleChunk   bool
+}
+
+type ProcessorConfig struct {
+	ModelProvider     blades.ModelProvider
+	OpenAIKey         string
+	OpenAIURL         string
+	ModelName         string
+	SystemPrompt      string
+	EnableInterceptor bool
+	SendSingleChunk   bool
+}
+
+func NewSentenceProcessor(config *ProcessorConfig) (*SentenceProcessor, error) {
+	modelProvider := config.ModelProvider
+	if modelProvider == nil {
+		modelName := config.ModelName
+		if modelName == "" {
+			modelName = "gpt-4.1-mini"
+		}
+
+		modelProvider = openai.NewModel(modelName, openai.Config{
+			APIKey:  config.OpenAIKey,
+			BaseURL: config.OpenAIURL,
+		})
+	}
+
+	systemPrompt := config.SystemPrompt
+	if systemPrompt == "" {
+		systemPrompt = os.Getenv("AGENT_SYSTEM_PROMPT")
+		if systemPrompt == "" {
+			systemPrompt = configv1.AgentSystemPrompt
+		}
+	}
+
+	defaultAgent := agent.NewProcessingAgent(
+		"default",
+		"Default agent for processing sentences",
+		systemPrompt,
+		modelProvider,
+	)
+
+	return &SentenceProcessor{
+		sentencePattern:   regexp.MustCompile(`[.!?。！？]+\s*$`),
+		modelProvider:     modelProvider,
+		agent:             defaultAgent,
+		enableInterceptor: config.EnableInterceptor,
+		sendSingleChunk:   config.SendSingleChunk,
+	}, nil
+}
+
+func (sp *SentenceProcessor) ProcessChunk(chunk string, callback func(string)) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	if !sp.enableInterceptor {
+		log.Printf("[ProcessChunk] Input chunk: %s", chunk)
+	}
+
+	var parsedChunk map[string]interface{}
+	if err := json.Unmarshal([]byte(chunk), &parsedChunk); err != nil {
+		if !sp.enableInterceptor {
+			log.Printf("[ProcessChunk] Failed to parse JSON: %v", err)
+		}
+
+		var parsedArray []interface{}
+		if arrayErr := json.Unmarshal([]byte(chunk), &parsedArray); arrayErr == nil {
+			if !sp.enableInterceptor {
+				log.Printf("[ProcessChunk] Detected array format with %d items", len(parsedArray))
+			}
+			for _, item := range parsedArray {
+				if itemStr, ok := item.(string); ok {
+					if !sp.enableInterceptor {
+						log.Printf("[ProcessChunk] Processing array item: %s", itemStr)
+					}
+					sp.ProcessChunk(itemStr, callback)
+				} else if itemMap, ok := item.(map[string]interface{}); ok {
+					itemJson, _ := json.Marshal(itemMap)
+					if !sp.enableInterceptor {
+						log.Printf("[ProcessChunk] Processing array item (object): %s", string(itemJson))
+					}
+					sp.ProcessChunk(string(itemJson), callback)
+				}
+			}
+			return
+		}
+
+		if sp.sendSingleChunk {
+			callback(chunk)
+		}
+		return
+	}
+
+	if choices, ok := parsedChunk["choices"].([]interface{}); ok {
+		if len(choices) == 0 {
+			if !sp.enableInterceptor {
+				log.Printf("[ProcessChunk] Empty choices array (usage info), skipping")
+			}
+			return
+		}
+
+		if choice, ok := choices[0].(map[string]interface{}); ok {
+			if delta, ok := choice["delta"].(map[string]interface{}); ok {
+				if len(delta) == 0 {
+					if !sp.enableInterceptor {
+						log.Printf("[ProcessChunk] Empty delta (finish signal), skipping")
+					}
+					return
+				}
+
+				content := sp.extractContentFromDelta(delta)
+				if content != "" {
+					sp.fullResponse.WriteString(content)
+				}
+
+				reasoningContent := sp.extractFieldFromDelta(delta, "reasoning_content")
+				if reasoningContent != "" {
+					sp.reasoningBuffer.WriteString(reasoningContent)
+				}
+
+				toolCalls := sp.extractToolCallsFromDelta(delta)
+				if toolCalls != "" {
+					sp.accumulateToolCalls(toolCalls)
+				}
+
+				finishReason := sp.extractFinishReason(choice)
+				if finishReason != "" && finishReason != "null" {
+					sp.responseComplete = true
+					log.Printf("[ProcessChunk] Response complete with finish_reason: %s", finishReason)
+
+					return
+				}
+
+				if sp.enableInterceptor {
+					return
+				}
+			}
+		}
+		if !sp.enableInterceptor {
+			log.Printf("[ProcessChunk] Choices exist but no content to process, skipping")
+		}
+		return
+	}
+
+	if !sp.enableInterceptor {
+		log.Printf("[ProcessChunk] No choices or empty choices, passing through: %s", chunk)
+		callback(chunk)
+	}
+}
+
+func (sp *SentenceProcessor) extractContentFromDelta(delta map[string]interface{}) string {
+	content := sp.extractFieldFromDelta(delta, "content")
+	if content != "" {
+		return content
+	}
+
+	reasoningContent := sp.extractFieldFromDelta(delta, "reasoning_content")
+	if reasoningContent != "" {
+		if !sp.enableInterceptor {
+			log.Printf("[extractContentFromDelta] Using reasoning_content: %s", reasoningContent)
+		}
+		return reasoningContent
+	}
+
+	return ""
+}
+
+func (sp *SentenceProcessor) extractFieldFromDelta(delta map[string]interface{}, fieldName string) string {
+	if field, ok := delta[fieldName]; ok {
+		switch v := field.(type) {
+		case string:
+			return v
+		case []interface{}:
+			var text strings.Builder
+			for _, item := range v {
+				if itemMap, ok := item.(map[string]interface{}); ok {
+					if textContent, ok := itemMap["text"].(string); ok {
+						text.WriteString(textContent)
+					}
+				}
+			}
+			return text.String()
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+func (sp *SentenceProcessor) extractToolCallsFromDelta(delta map[string]interface{}) string {
+	if toolCalls, ok := delta["tool_calls"]; ok {
+		switch v := toolCalls.(type) {
+		case []interface{}:
+			if len(v) > 0 {
+				jsonBytes, err := json.Marshal(v)
+				if err != nil {
+					return ""
+				}
+				return string(jsonBytes)
+			}
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+func (sp *SentenceProcessor) accumulateToolCalls(toolCalls string) {
+	if sp.toolCallsMap == nil {
+		sp.toolCallsMap = make(map[int]map[string]interface{})
+	}
+
+	var toolCallsArray []interface{}
+	if err := json.Unmarshal([]byte(toolCalls), &toolCallsArray); err != nil {
+		log.Printf("[accumulateToolCalls] Failed to unmarshal tool calls: %v", err)
+		return
+	}
+
+	for _, tc := range toolCallsArray {
+		if toolCall, ok := tc.(map[string]interface{}); ok {
+			if index, ok := toolCall["index"].(float64); ok {
+				idx := int(index)
+				if _, exists := sp.toolCallsMap[idx]; !exists {
+					sp.toolCallsMap[idx] = make(map[string]interface{})
+					sp.toolCallsMap[idx]["index"] = idx
+				}
+
+				if id, ok := toolCall["id"].(string); ok {
+					sp.toolCallsMap[idx]["id"] = id
+				}
+
+				if toolType, ok := toolCall["type"].(string); ok {
+					sp.toolCallsMap[idx]["type"] = toolType
+				}
+
+				if function, ok := toolCall["function"].(map[string]interface{}); ok {
+					if _, exists := sp.toolCallsMap[idx]["function"]; !exists {
+						sp.toolCallsMap[idx]["function"] = make(map[string]interface{})
+					}
+
+					if name, ok := function["name"].(string); ok {
+						sp.toolCallsMap[idx]["function"].(map[string]interface{})["name"] = name
+					}
+
+					if arguments, ok := function["arguments"].(string); ok {
+						if existingArgs, exists := sp.toolCallsMap[idx]["function"].(map[string]interface{})["arguments"]; exists {
+							if existingArgsStr, ok := existingArgs.(string); ok {
+								sp.toolCallsMap[idx]["function"].(map[string]interface{})["arguments"] = existingArgsStr + arguments
+							}
+						} else {
+							sp.toolCallsMap[idx]["function"].(map[string]interface{})["arguments"] = arguments
+						}
+					}
+				}
+			}
+		}
+	}
+
+	log.Printf("[accumulateToolCalls] Accumulated tool calls: %+v", sp.toolCallsMap)
+}
+
+func (sp *SentenceProcessor) getCompleteToolCalls() string {
+	if len(sp.toolCallsMap) == 0 {
+		return ""
+	}
+
+	var toolCallsArray []interface{}
+	for i := 0; i < len(sp.toolCallsMap); i++ {
+		if toolCall, exists := sp.toolCallsMap[i]; exists {
+			toolCallsArray = append(toolCallsArray, toolCall)
+		}
+	}
+
+	jsonBytes, err := json.Marshal(toolCallsArray)
+	if err != nil {
+		log.Printf("[getCompleteToolCalls] Failed to marshal tool calls: %v", err)
+		return ""
+	}
+	result := string(jsonBytes)
+	log.Printf("[getCompleteToolCalls] Complete tool calls: %s", result)
+	return result
+}
+
+func (sp *SentenceProcessor) extractFinishReason(choice map[string]interface{}) string {
+	if finishReason, ok := choice["finish_reason"]; ok {
+		switch v := finishReason.(type) {
+		case string:
+			return v
+		case nil:
+			return "null"
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+func (sp *SentenceProcessor) Flush(callback func(string)) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	if sp.fullResponse.Len() > 0 {
+		fullResponse := sp.fullResponse.String()
+		reasoningSentence := sp.reasoningBuffer.String()
+		toolCallsStr := sp.getCompleteToolCalls()
+
+		log.Printf("[Flush] Flushing full response: %s", fullResponse)
+		if err := sp.processWithAgent(fullResponse, reasoningSentence, toolCallsStr, callback); err != nil {
+			log.Printf("[Flush] Agent processing error: %v, falling back to original", err)
+		}
+
+		sp.fullResponse.Reset()
+		sp.reasoningBuffer.Reset()
+		sp.toolCallsBuffer.Reset()
+		sp.toolCallsMap = nil
+		sp.responseComplete = false
+	}
+}
+
+func (sp *SentenceProcessor) isCompleteSentence(text string) bool {
+	return sp.sentencePattern.MatchString(text)
+}
+
+func (sp *SentenceProcessor) isCompleteToolCalls(toolCalls string) bool {
+	return strings.Contains(toolCalls, "}")
+}
+
+func (sp *SentenceProcessor) processWithAgent(sentence string, reasoningSentence string, toolCalls string, callback func(string)) error {
+	ctx := context.Background()
+
+	if sp.agent != nil {
+		invocation := &blades.Invocation{
+			Message: blades.UserMessage(sentence),
+		}
+
+		log.Printf("[processWithAgent] Sending to agent: %s", sentence)
+		gen := sp.agent.Run(ctx, invocation)
+
+		var fullAgentResponse strings.Builder
+		for msg, err := range gen {
+			if err != nil {
+				log.Printf("[processWithAgent] Agent error: %v", err)
+				return err
+			}
+			if msg == nil {
+				continue
+			}
+
+			content := sp.extractTextContent(msg)
+			if content != "" {
+				fullAgentResponse.WriteString(content)
+			}
+		}
+
+		agentResponse := fullAgentResponse.String()
+		log.Printf("[processWithAgent] Agent full response: %s", agentResponse)
+
+		sp.simulateStreamOutput(agentResponse, reasoningSentence, toolCalls, callback)
+	} else {
+		result := sp.formatAsSSE(sentence, reasoningSentence, toolCalls)
+		log.Printf("[processWithAgent] No agent, passing through: %s", sentence)
+		log.Printf("[processWithAgent] Formatted SSE: %s", result)
+		callback(result)
+	}
+	return nil
+}
+
+func (sp *SentenceProcessor) simulateStreamOutput(content string, reasoningSentence string, toolCalls string, callback func(string)) {
+	runes := []rune(content)
+	chunkSize := 10
+
+	for i := 0; i < len(runes); i += chunkSize {
+		end := i + chunkSize
+		if end > len(runes) {
+			end = len(runes)
+		}
+
+		chunk := string(runes[i:end])
+		result := sp.formatAsSSE(chunk, reasoningSentence, toolCalls)
+		log.Printf("[simulateStreamOutput] Sending chunk: %s", chunk)
+		callback(result)
+	}
+}
+
+func (sp *SentenceProcessor) extractTextContent(msg *blades.Message) string {
+	if msg == nil {
+		return ""
+	}
+
+	for _, part := range msg.Parts {
+		if text, ok := part.(blades.TextPart); ok {
+			return text.Text
+		}
+	}
+	return ""
+}
+
+func (sp *SentenceProcessor) formatAsSSE(content string, reasoningContent string, toolCalls string) string {
+	delta := map[string]interface{}{}
+
+	if content != "" {
+		delta["content"] = content
+	}
+
+	if reasoningContent != "" {
+		delta["reasoning_content"] = reasoningContent
+	}
+
+	if toolCalls != "" {
+		var toolCallsArray []interface{}
+		if err := json.Unmarshal([]byte(toolCalls), &toolCallsArray); err == nil && len(toolCallsArray) > 0 {
+			delta["tool_calls"] = toolCallsArray
+		}
+	}
+
+	response := map[string]interface{}{
+		"id":      "chatcmpl-" + generateID(),
+		"object":  "chat.completion.chunk",
+		"created": getCurrentTimestamp(),
+		"model":   "gpt-3.5-turbo",
+		"choices": []map[string]interface{}{
+			{
+				"index":         0,
+				"delta":         delta,
+				"finish_reason": nil,
+			},
+		},
+	}
+
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		return ""
+	}
+	return string(jsonData)
+}
+
+func generateID() string {
+	return "proxy-" + randomString(16)
+}
+
+func getCurrentTimestamp() int64 {
+	return time.Now().Unix()
+}
+
+func randomString(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
+}
+
+func (sp *SentenceProcessor) SetAgent(agent blades.Agent) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	sp.agent = agent
+}

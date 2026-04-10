@@ -1,0 +1,556 @@
+package processor
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"math/rand"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Frank-svg-dev/conch-proxy/internal/agent"
+	configv1 "github.com/Frank-svg-dev/conch-proxy/internal/config"
+	"github.com/go-kratos/blades"
+	"github.com/go-kratos/blades/contrib/openai"
+)
+
+// ToolCallAccumulator 用于累积单个工具调用的碎片数据
+type ToolCallAccumulator struct {
+	Index     int
+	ID        string
+	Type      string
+	Name      string
+	Arguments strings.Builder
+	Complete  bool
+}
+
+type SentenceProcessor struct {
+	fullResponse       strings.Builder
+	reasoningBuffer    strings.Builder
+	sentencePattern    *regexp.Regexp
+	agent              blades.Agent
+	modelProvider      blades.ModelProvider
+	mu                 sync.Mutex
+	enableInterceptor  bool
+	responseComplete   bool
+	sendSingleChunk    bool
+	toolAccumulators   map[int]*ToolCallAccumulator // 按 index 累积工具调用
+	lastToolCallIndex  int                          // 记录上一个工具调用的 index
+}
+
+type ProcessorConfig struct {
+	ModelProvider   blades.ModelProvider
+	OpenAIKey       string
+	OpenAIURL       string
+	ModelName       string
+	SystemPrompt    string
+	EnableInterceptor bool
+	SendSingleChunk bool
+}
+
+func NewSentenceProcessor(config *ProcessorConfig) (*SentenceProcessor, error) {
+	modelProvider := config.ModelProvider
+	if modelProvider == nil {
+		modelName := config.ModelName
+		if modelName == "" {
+			modelName = "gpt-4.1-mini"
+		}
+
+		modelProvider = openai.NewModel(modelName, openai.Config{
+			APIKey:  config.OpenAIKey,
+			BaseURL: config.OpenAIURL,
+		})
+	}
+
+	systemPrompt := config.SystemPrompt
+	if systemPrompt == "" {
+		systemPrompt = os.Getenv("AGENT_SYSTEM_PROMPT")
+		if systemPrompt == "" {
+			systemPrompt = configv1.AgentSystemPrompt
+		}
+	}
+
+	defaultAgent := agent.NewProcessingAgent(
+		"default",
+		"Default agent for processing sentences",
+		systemPrompt,
+		modelProvider,
+	)
+
+	return &SentenceProcessor{
+		sentencePattern:   regexp.MustCompile(`[.!?。！？]+\s*$`),
+		modelProvider:     modelProvider,
+		agent:             defaultAgent,
+		enableInterceptor: config.EnableInterceptor,
+		sendSingleChunk:   config.SendSingleChunk,
+		toolAccumulators:  make(map[int]*ToolCallAccumulator),
+		lastToolCallIndex: -1,
+	}, nil
+}
+
+func (sp *SentenceProcessor) ProcessChunk(chunk string, callback func(string)) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	if !sp.enableInterceptor {
+		log.Printf("[ProcessChunk] Input chunk: %s", chunk)
+	}
+
+	var parsedChunk map[string]interface{}
+	if err := json.Unmarshal([]byte(chunk), &parsedChunk); err != nil {
+		if !sp.enableInterceptor {
+			log.Printf("[ProcessChunk] Failed to parse JSON: %v", err)
+		}
+
+		var parsedArray []interface{}
+		if arrayErr := json.Unmarshal([]byte(chunk), &parsedArray); arrayErr == nil {
+			if !sp.enableInterceptor {
+				log.Printf("[ProcessChunk] Detected array format with %d items", len(parsedArray))
+			}
+			for _, item := range parsedArray {
+				if itemStr, ok := item.(string); ok {
+					if !sp.enableInterceptor {
+						log.Printf("[ProcessChunk] Processing array item: %s", itemStr)
+					}
+					sp.ProcessChunk(itemStr, callback)
+				} else if itemMap, ok := item.(map[string]interface{}); ok {
+					itemJson, _ := json.Marshal(itemMap)
+					if !sp.enableInterceptor {
+						log.Printf("[ProcessChunk] Processing array item (object): %s", string(itemJson))
+					}
+					sp.ProcessChunk(string(itemJson), callback)
+				}
+			}
+			return
+		}
+
+		if sp.sendSingleChunk {
+			callback(chunk)
+		}
+		return
+	}
+
+	if choices, ok := parsedChunk["choices"].([]interface{}); ok {
+		if len(choices) == 0 {
+			if !sp.enableInterceptor {
+				log.Printf("[ProcessChunk] Empty choices array (usage info), skipping")
+			}
+			return
+		}
+
+		if choice, ok := choices[0].(map[string]interface{}); ok {
+			if delta, ok := choice["delta"].(map[string]interface{}); ok {
+				if len(delta) == 0 {
+					if !sp.enableInterceptor {
+						log.Printf("[ProcessChunk] Empty delta (finish signal), skipping")
+					}
+					return
+				}
+
+				content := sp.extractContentFromDelta(delta)
+				if content != "" {
+					sp.fullResponse.WriteString(content)
+				}
+
+				reasoningContent := sp.extractFieldFromDelta(delta, "reasoning_content")
+				if reasoningContent != "" {
+					sp.reasoningBuffer.WriteString(reasoningContent)
+				}
+
+				// 处理工具调用 - 累积并实时发送
+				toolCallsJSON := sp.extractToolCallsFromDelta(delta)
+				if toolCallsJSON != "" {
+					sp.processToolCalls(toolCallsJSON, callback)
+				}
+
+				finishReason := sp.extractFinishReason(choice)
+				if finishReason != "" && finishReason != "null" {
+					sp.responseComplete = true
+					log.Printf("[ProcessChunk] Response complete with finish_reason: %s", finishReason)
+					
+					// 响应完成时发送所有累积的工具调用
+					sp.flushToolCalls(callback)
+					
+					// 清空累积器
+					sp.toolAccumulators = make(map[int]*ToolCallAccumulator)
+					sp.lastToolCallIndex = -1
+					return
+				}
+
+				if sp.enableInterceptor {
+					return
+				}
+			}
+		}
+		if !sp.enableInterceptor {
+			log.Printf("[ProcessChunk] Choices exist but no content to process, skipping")
+		}
+		return
+	}
+
+	if !sp.enableInterceptor {
+		log.Printf("[ProcessChunk] No choices or empty choices, passing through: %s", chunk)
+		callback(chunk)
+	}
+}
+
+// processToolCalls 处理工具调用：只累积，不发送（等待 finish_reason）
+func (sp *SentenceProcessor) processToolCalls(toolCallsJSON string, callback func(string)) {
+	var toolCallsArray []interface{}
+	if err := json.Unmarshal([]byte(toolCallsJSON), &toolCallsArray); err != nil {
+		log.Printf("[processToolCalls] Unmarshal error: %v", err)
+		return
+	}
+
+	// 检测是否是新的工具调用序列（通过比较第一个 tool_call 的 ID）
+	if len(toolCallsArray) > 0 {
+		if firstCall, ok := toolCallsArray[0].(map[string]interface{}); ok {
+			if id, ok := firstCall["id"].(string); ok && id != "" {
+				// 检查是否已经累积过这个 ID
+				alreadyExists := false
+				for _, acc := range sp.toolAccumulators {
+					if acc.ID == id {
+						alreadyExists = true
+						break
+					}
+				}
+				// 如果是全新的 ID 且已有累积，说明是新序列
+				if !alreadyExists && len(sp.toolAccumulators) > 0 {
+					log.Printf("[processToolCalls] New tool call sequence detected (new ID: %s), clearing accumulators", id)
+					sp.toolAccumulators = make(map[int]*ToolCallAccumulator)
+				}
+			}
+		}
+	}
+
+	for _, tc := range toolCallsArray {
+		toolCall, ok := tc.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// 获取 index
+		indexFloat, ok := toolCall["index"].(float64)
+		if !ok {
+			continue
+		}
+		index := int(indexFloat)
+
+		// 更新最大 index
+		if index > sp.lastToolCallIndex {
+			sp.lastToolCallIndex = index
+		}
+
+		// 获取或创建累积器
+		acc, exists := sp.toolAccumulators[index]
+		if !exists {
+			acc = &ToolCallAccumulator{Index: index}
+			sp.toolAccumulators[index] = acc
+		}
+
+		// 累积字段（只累积非空值）
+		if id, ok := toolCall["id"].(string); ok && id != "" {
+			acc.ID = id
+		}
+		if toolType, ok := toolCall["type"].(string); ok && toolType != "" {
+			acc.Type = toolType
+		}
+
+		// 处理 function 字段
+		if fn, ok := toolCall["function"].(map[string]interface{}); ok {
+			if name, ok := fn["name"].(string); ok && name != "" {
+				acc.Name = name
+			}
+			if args, ok := fn["arguments"].(string); ok {
+				acc.Arguments.WriteString(args)
+				log.Printf("[processToolCalls] Accumulating args[%d]: %s", index, args)
+			}
+		}
+
+		log.Printf("[processToolCalls] Accumulated tool call[%d]: id=%s, name=%s, args_len=%d", 
+			index, acc.ID, acc.Name, acc.Arguments.Len())
+	}
+	// 注意：这里不发送，等待 finish_reason 触发时统一发送
+}
+
+// buildToolCall 从累积器构建完整的工具调用对象
+func (sp *SentenceProcessor) buildToolCall(acc *ToolCallAccumulator) map[string]interface{} {
+	if acc.ID == "" || acc.Type == "" || acc.Name == "" {
+		return nil // 必要字段不完整
+	}
+
+	return map[string]interface{}{
+		"index": acc.Index,
+		"id":    acc.ID,
+		"type":  acc.Type,
+		"function": map[string]interface{}{
+			"name":      acc.Name,
+			"arguments": acc.Arguments.String(),
+		},
+	}
+}
+
+// flushToolCalls 在 finish_reason 时发送所有累积的工具调用
+func (sp *SentenceProcessor) flushToolCalls(callback func(string)) {
+	if len(sp.toolAccumulators) == 0 {
+		log.Printf("[flushToolCalls] No tool calls to flush")
+		return
+	}
+
+	// 按 index 排序后输出
+	var completeToolCalls []interface{}
+	for i := 0; i <= sp.lastToolCallIndex; i++ {
+		if acc, exists := sp.toolAccumulators[i]; exists {
+			tc := sp.buildToolCall(acc)
+			if tc != nil {
+				completeToolCalls = append(completeToolCalls, tc)
+				log.Printf("[flushToolCalls] Flushed tool call[%d]: %s", i, acc.ID)
+			} else {
+				log.Printf("[flushToolCalls] Incomplete tool call[%d]: id=%s, name=%s, type=%s, args_len=%d", 
+					i, acc.ID, acc.Name, acc.Type, acc.Arguments.Len())
+			}
+		}
+	}
+
+	if len(completeToolCalls) > 0 {
+		jsonBytes, err := json.Marshal(completeToolCalls)
+		if err != nil {
+			log.Printf("[flushToolCalls] Marshal error: %v", err)
+			return
+		}
+		result := sp.formatAsSSE("", "", string(jsonBytes))
+		log.Printf("[flushToolCalls] Sending complete tool calls: %s", string(jsonBytes))
+		callback(result)
+	} else {
+		log.Printf("[flushToolCalls] No complete tool calls to send")
+	}
+}
+
+func (sp *SentenceProcessor) extractContentFromDelta(delta map[string]interface{}) string {
+	content := sp.extractFieldFromDelta(delta, "content")
+	if content != "" {
+		return content
+	}
+
+	reasoningContent := sp.extractFieldFromDelta(delta, "reasoning_content")
+	if reasoningContent != "" {
+		if !sp.enableInterceptor {
+			log.Printf("[extractContentFromDelta] Using reasoning_content: %s", reasoningContent)
+		}
+		return reasoningContent
+	}
+
+	return ""
+}
+
+func (sp *SentenceProcessor) extractFieldFromDelta(delta map[string]interface{}, fieldName string) string {
+	if field, ok := delta[fieldName]; ok {
+		switch v := field.(type) {
+		case string:
+			return v
+		case []interface{}:
+			var text strings.Builder
+			for _, item := range v {
+				if itemMap, ok := item.(map[string]interface{}); ok {
+					if textContent, ok := itemMap["text"].(string); ok {
+						text.WriteString(textContent)
+					}
+				}
+			}
+			return text.String()
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+func (sp *SentenceProcessor) extractToolCallsFromDelta(delta map[string]interface{}) string {
+	if toolCalls, ok := delta["tool_calls"]; ok {
+		switch v := toolCalls.(type) {
+		case []interface{}:
+			if len(v) > 0 {
+				jsonBytes, err := json.Marshal(v)
+				if err != nil {
+					return ""
+				}
+				return string(jsonBytes)
+			}
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+func (sp *SentenceProcessor) extractFinishReason(choice map[string]interface{}) string {
+	if finishReason, ok := choice["finish_reason"]; ok {
+		switch v := finishReason.(type) {
+		case string:
+			return v
+		case nil:
+			return "null"
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+func (sp *SentenceProcessor) Flush(callback func(string)) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	if sp.fullResponse.Len() > 0 {
+		fullResponse := sp.fullResponse.String()
+		reasoningSentence := sp.reasoningBuffer.String()
+
+		log.Printf("[Flush] Flushing full response: %s", fullResponse)
+		if err := sp.processWithAgent(fullResponse, reasoningSentence, callback); err != nil {
+			log.Printf("[Flush] Agent processing error: %v, falling back to original", err)
+		}
+
+		sp.fullResponse.Reset()
+		sp.reasoningBuffer.Reset()
+		sp.responseComplete = false
+	}
+}
+
+func (sp *SentenceProcessor) isCompleteSentence(text string) bool {
+	return sp.sentencePattern.MatchString(text)
+}
+
+func (sp *SentenceProcessor) processWithAgent(sentence string, reasoningSentence string, callback func(string)) error {
+	ctx := context.Background()
+
+	if sp.agent != nil {
+		invocation := &blades.Invocation{
+			Message: blades.UserMessage(sentence),
+		}
+
+		log.Printf("[processWithAgent] Sending to agent: %s", sentence)
+		gen := sp.agent.Run(ctx, invocation)
+
+		var fullAgentResponse strings.Builder
+		for msg, err := range gen {
+			if err != nil {
+				log.Printf("[processWithAgent] Agent error: %v", err)
+				return err
+			}
+			if msg == nil {
+				continue
+			}
+
+			content := sp.extractTextContent(msg)
+			if content != "" {
+				fullAgentResponse.WriteString(content)
+			}
+		}
+
+		agentResponse := fullAgentResponse.String()
+		log.Printf("[processWithAgent] Agent full response: %s", agentResponse)
+
+		sp.simulateStreamOutput(agentResponse, reasoningSentence, callback)
+	} else {
+		result := sp.formatAsSSE(sentence, reasoningSentence, "")
+		log.Printf("[processWithAgent] No agent, passing through: %s", sentence)
+		log.Printf("[processWithAgent] Formatted SSE: %s", result)
+		callback(result)
+	}
+	return nil
+}
+
+func (sp *SentenceProcessor) simulateStreamOutput(content string, reasoningSentence string, callback func(string)) {
+	runes := []rune(content)
+	chunkSize := 10
+
+	for i := 0; i < len(runes); i += chunkSize {
+		end := i + chunkSize
+		if end > len(runes) {
+			end = len(runes)
+		}
+
+		chunk := string(runes[i:end])
+		result := sp.formatAsSSE(chunk, reasoningSentence, "")
+		log.Printf("[simulateStreamOutput] Sending chunk: %s", chunk)
+		callback(result)
+	}
+}
+
+func (sp *SentenceProcessor) extractTextContent(msg *blades.Message) string {
+	if msg == nil {
+		return ""
+	}
+
+	for _, part := range msg.Parts {
+		if text, ok := part.(blades.TextPart); ok {
+			return text.Text
+		}
+	}
+	return ""
+}
+
+func (sp *SentenceProcessor) formatAsSSE(content string, reasoningContent string, toolCalls string) string {
+	delta := map[string]interface{}{}
+
+	if content != "" {
+		delta["content"] = content
+	}
+
+	if reasoningContent != "" {
+		delta["reasoning_content"] = reasoningContent
+	}
+
+	if toolCalls != "" {
+		var toolCallsArray []interface{}
+		if err := json.Unmarshal([]byte(toolCalls), &toolCallsArray); err == nil && len(toolCallsArray) > 0 {
+			delta["tool_calls"] = toolCallsArray
+		}
+	}
+
+	response := map[string]interface{}{
+		"id":      "chatcmpl-" + generateID(),
+		"object":  "chat.completion.chunk",
+		"created": getCurrentTimestamp(),
+		"model":   "gpt-3.5-turbo",
+		"choices": []map[string]interface{}{
+			{
+				"index":         0,
+				"delta":         delta,
+				"finish_reason": nil,
+			},
+		},
+	}
+
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		return ""
+	}
+	return string(jsonData)
+}
+
+func generateID() string {
+	return "proxy-" + randomString(16)
+}
+
+func getCurrentTimestamp() int64 {
+	return time.Now().Unix()
+}
+
+func randomString(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
+}
+
+func (sp *SentenceProcessor) SetAgent(agent blades.Agent) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	sp.agent = agent
+}

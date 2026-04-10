@@ -1,13 +1,18 @@
 package handler
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/Frank-svg-dev/conch-proxy/internal/cache"
 	"github.com/Frank-svg-dev/conch-proxy/internal/interceptor"
 	"github.com/Frank-svg-dev/conch-proxy/internal/processor"
 	"github.com/gin-gonic/gin"
@@ -17,29 +22,39 @@ type OpenAIHandler struct {
 	apiKey      string
 	apiURL      string
 	proxyURL    string
+	httpClient  *http.Client
 	interceptor *interceptor.StreamInterceptor
 	processor   *processor.SentenceProcessor
 }
 
-func NewOpenAIHandler(apiKey, apiURL, proxyURL string, enableInterceptor bool, agentSystemPrompt string, sendSingleChunk bool) *OpenAIHandler {
+func NewOpenAIHandler(upstreamAPIKey, upstreamAPIURL, proxyURL string, enableInterceptor bool, agentSystemPrompt string, sendSingleChunk bool, slmAPIKey, slmAPIURL, slmModel string) *OpenAIHandler {
 	var proc *processor.SentenceProcessor
 	var streamInterceptor *interceptor.StreamInterceptor
 
 	if enableInterceptor {
 		procConfig := &processor.ProcessorConfig{
-			OpenAIKey:         apiKey,
-			OpenAIURL:         apiURL,
+			SLMAPIKey:         slmAPIKey,
+			SLMAPIURL:         slmAPIURL,
+			SLMModel:          slmModel,
 			EnableInterceptor: enableInterceptor,
 			SendSingleChunk:   sendSingleChunk,
+			SystemPrompt:      agentSystemPrompt,
 		}
 		proc, _ = processor.NewSentenceProcessor(procConfig)
 		streamInterceptor = interceptor.NewStreamInterceptor(proc)
 	}
 
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
 	return &OpenAIHandler{
-		apiKey:      apiKey,
-		apiURL:      apiURL,
+		apiKey:      upstreamAPIKey,
+		apiURL:      upstreamAPIURL,
 		proxyURL:    proxyURL,
+		httpClient:  &http.Client{Timeout: 20 * time.Minute, Transport: transport},
 		interceptor: streamInterceptor,
 		processor:   proc,
 	}
@@ -149,14 +164,6 @@ type Usage struct {
 }
 
 func (h *OpenAIHandler) ChatCompletion(c *gin.Context) {
-	// bodys, err := io.ReadAll(c.Request.Body)
-	// if err != nil {
-	// 	c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-	// 	return
-	// }
-
-	// fmt.Println(string(bodys))
-
 	var req ChatCompletionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -184,8 +191,7 @@ func (h *OpenAIHandler) ChatCompletion(c *gin.Context) {
 
 	h.setRequestHeaders(httpReq, c)
 
-	client := h.getHTTPClient()
-	resp, err := client.Do(httpReq)
+	resp, err := h.getHTTPClient().Do(httpReq)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -202,21 +208,27 @@ func (h *OpenAIHandler) ChatCompletion(c *gin.Context) {
 }
 
 func (h *OpenAIHandler) handleStreamRequest(c *gin.Context, req ChatCompletionRequest) {
-	// 检查最后一条用户消息是否包含Token，如果是则解锁Session
-	// 只检查最后一条用户消息，避免消息历史中的过期口令重复触发解锁
+	sessionID := h.getSessionID(c)
+	if h.processor != nil {
+		h.processor.SetCurrentSessionID(sessionID)
+	}
+
+	// 处理用户口令解锁逻辑
 	if h.processor != nil && len(req.Messages) > 0 {
-		// 从后往前找最后一条用户消息
 		for i := len(req.Messages) - 1; i >= 0; i-- {
 			msg := req.Messages[i]
 			if msg.Role == "user" {
 				contentText := msg.GetContentText()
 				if contentText != "" && strings.Contains(contentText, "口令: ") {
-					h.processor.CheckAndUnlockSession(contentText)
+					h.processor.CheckAndUnlockSession(contentText, sessionID)
 				}
-				break // 只检查最后一条用户消息
+				break
 			}
 		}
 	}
+
+	// 处理assistant消息，还原Redis中存储的原始内容
+	h.restoreAssistantMessages(&req.Messages)
 
 	jsonData, err := json.Marshal(req)
 	if err != nil {
@@ -232,8 +244,7 @@ func (h *OpenAIHandler) handleStreamRequest(c *gin.Context, req ChatCompletionRe
 
 	h.setRequestHeaders(httpReq, c)
 
-	client := h.getHTTPClient()
-	resp, err := client.Do(httpReq)
+	resp, err := h.getHTTPClient().Do(httpReq)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -255,27 +266,29 @@ func (h *OpenAIHandler) handleStreamRequest(c *gin.Context, req ChatCompletionRe
 		return
 	}
 
-	reader := resp.Body
-	buf := make([]byte, 1024)
+	h.streamSSEPassthrough(c, resp.Body, flusher)
+}
 
-	for {
-		n, err := reader.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				fmt.Fprintf(c.Writer, "data: [ERROR] %s\n\n", err.Error())
-			}
-			break
+func (h *OpenAIHandler) streamSSEPassthrough(c *gin.Context, reader io.Reader, flusher http.Flusher) {
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
 		}
 
-		data := string(buf[:n])
-		lines := strings.Split(data, "\n")
-
-		for _, line := range lines {
-			if strings.HasPrefix(line, "data: ") {
-				c.Writer.WriteString(line + "\n")
-				flusher.Flush()
+		if strings.HasPrefix(line, "data: ") {
+			c.Writer.WriteString(line + "\n\n")
+			flusher.Flush()
+			if line == "data: [DONE]" {
+				return
 			}
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(c.Writer, "data: [ERROR] %s\n\n", err.Error())
+		flusher.Flush()
 	}
 
 	c.Writer.WriteString("data: [DONE]\n\n")
@@ -289,12 +302,45 @@ func (h *OpenAIHandler) setRequestHeaders(req *http.Request, c *gin.Context) {
 	if h.proxyURL != "" {
 		req.Header.Set("X-Proxy-URL", h.proxyURL)
 	}
-
-	if apiKey := c.GetHeader("Authorization"); apiKey != "" {
-		req.Header.Set("Authorization", apiKey)
-	}
 }
 
 func (h *OpenAIHandler) getHTTPClient() *http.Client {
-	return &http.Client{}
+	return h.httpClient
+}
+
+func (h *OpenAIHandler) getSessionID(c *gin.Context) string {
+	if sessionID := strings.TrimSpace(c.GetHeader("X-Session-ID")); sessionID != "" {
+		return sessionID
+	}
+
+	auth := strings.TrimSpace(c.GetHeader("Authorization"))
+	if auth != "" {
+		return auth
+	}
+
+	return c.ClientIP()
+}
+
+func (h *OpenAIHandler) restoreAssistantMessages(messages *[]Message) {
+	if messages == nil {
+		return
+	}
+	ctx := context.Background()
+	for i := range *messages {
+		msg := (*messages)[i]
+		if msg.Role == "assistant" {
+			contentText := msg.GetContentText()
+			if contentText != "" {
+				originalContent, err := cache.GetOriginalContent(ctx, contentText)
+				if err != nil {
+					log.Printf("[restoreAssistantMessages] Failed to get from Redis: %v", err)
+					continue
+				}
+				if originalContent != "" {
+					log.Printf("[restoreAssistantMessages] Restored original content for message %d, hash: %s", i, cache.ComputeSHA256(contentText))
+					(*messages)[i].Content = originalContent
+				}
+			}
+		}
+	}
 }

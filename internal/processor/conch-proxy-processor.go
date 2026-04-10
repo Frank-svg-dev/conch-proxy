@@ -7,11 +7,13 @@ import (
 	"math/rand"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Frank-svg-dev/conch-proxy/internal/agent"
+	"github.com/Frank-svg-dev/conch-proxy/internal/cache"
 	configv1 "github.com/Frank-svg-dev/conch-proxy/internal/config"
 	"github.com/go-kratos/blades"
 	"github.com/go-kratos/blades/contrib/openai"
@@ -42,15 +44,17 @@ type SentenceProcessor struct {
 	sessionCounters           map[string]int       // Session计数器
 	sessionUnlocks            map[string]bool      // Session解锁状态
 	sessionUnlockTime         map[string]time.Time // Session解锁时间
+	currentSessionID          string               // 当前请求SessionID
+	unlockDuration            time.Duration        // 解锁有效期
 	token                     string               // 校验Token
 	originalEnableInterceptor bool                 // 原始拦截器开关
 }
 
 type ProcessorConfig struct {
 	ModelProvider     blades.ModelProvider
-	OpenAIKey         string
-	OpenAIURL         string
-	ModelName         string
+	SLMAPIKey         string
+	SLMAPIURL         string
+	SLMModel          string
 	SystemPrompt      string
 	EnableInterceptor bool
 	SendSingleChunk   bool
@@ -59,14 +63,14 @@ type ProcessorConfig struct {
 func NewSentenceProcessor(config *ProcessorConfig) (*SentenceProcessor, error) {
 	modelProvider := config.ModelProvider
 	if modelProvider == nil {
-		modelName := config.ModelName
+		modelName := config.SLMModel
 		if modelName == "" {
 			modelName = "gpt-4.1-mini"
 		}
 
 		modelProvider = openai.NewModel(modelName, openai.Config{
-			APIKey:  config.OpenAIKey,
-			BaseURL: config.OpenAIURL,
+			APIKey:  config.SLMAPIKey,
+			BaseURL: config.SLMAPIURL,
 		})
 	}
 
@@ -85,6 +89,11 @@ func NewSentenceProcessor(config *ProcessorConfig) (*SentenceProcessor, error) {
 		modelProvider,
 	)
 
+	unlockMinutes, err := strconv.Atoi(os.Getenv("UNLOCK_TTL_MINUTES"))
+	if err != nil || unlockMinutes <= 0 {
+		unlockMinutes = 60
+	}
+
 	return &SentenceProcessor{
 		sentencePattern:           regexp.MustCompile(`[.!?。！？]+\s*$`),
 		modelProvider:             modelProvider,
@@ -97,6 +106,8 @@ func NewSentenceProcessor(config *ProcessorConfig) (*SentenceProcessor, error) {
 		sessionCounters:           make(map[string]int),
 		sessionUnlocks:            make(map[string]bool),
 		sessionUnlockTime:         make(map[string]time.Time),
+		currentSessionID:          "default-session",
+		unlockDuration:            time.Duration(unlockMinutes) * time.Minute,
 		token:                     os.Getenv("SENSITIVE_TOKEN"),
 	}, nil
 }
@@ -469,6 +480,15 @@ func (sp *SentenceProcessor) processWithAgent(sentence string, reasoningSentence
 
 		log.Printf("[processWithAgent] Stateless Agent full response: %s", finalContent)
 
+		// 将脱敏内容(SLM处理后的内容)和原始内容存储到Redis
+		if sentence != "" && finalContent != "" && sentence != finalContent {
+			if err := cache.SetDesensitizedContent(ctx, finalContent, sentence); err != nil {
+				log.Printf("[processWithAgent] Failed to store to Redis: %v", err)
+			} else {
+				log.Printf("[processWithAgent] Stored desensitized content to Redis, hash: %s", cache.ComputeSHA256(finalContent))
+			}
+		}
+
 		// 检查敏感标签
 		processedContent := sp.checkSensitiveTags(finalContent)
 
@@ -516,8 +536,9 @@ func (sp *SentenceProcessor) checkSensitiveTags(content string) string {
 }
 
 func (sp *SentenceProcessor) getSessionID() string {
-	// 这里使用固定ID，实际应该从请求中获取
-	// 可以从gin.Context中获取，或者生成一个唯一的session ID
+	if sp.currentSessionID != "" {
+		return sp.currentSessionID
+	}
 	return "default-session"
 }
 
@@ -543,7 +564,7 @@ func (sp *SentenceProcessor) isSessionUnlocked(sessionID string) bool {
 		return false
 	}
 
-	// 检查解锁时间是否过期（1小时）
+	// 检查解锁时间是否过期
 	if unlockTime, exists := sp.sessionUnlockTime[sessionID]; exists {
 		if time.Now().After(unlockTime) {
 			log.Printf("[isSessionUnlocked] Session %s unlock time expired", sessionID)
@@ -566,7 +587,7 @@ func (sp *SentenceProcessor) checkAndUnlockSession(input string, sessionID strin
 	tokenPattern := "口令: " + sp.token
 	if strings.Contains(input, tokenPattern) {
 		log.Printf("[checkAndUnlockSession] Token matched, unlocking session")
-		// 解锁Session，有效期1小时
+		// 解锁Session，按配置时长有效
 		if sp.sessionUnlocks == nil {
 			sp.sessionUnlocks = make(map[string]bool)
 		}
@@ -574,24 +595,24 @@ func (sp *SentenceProcessor) checkAndUnlockSession(input string, sessionID strin
 			sp.sessionUnlockTime = make(map[string]time.Time)
 		}
 		sp.sessionUnlocks[sessionID] = true
-		sp.sessionUnlockTime[sessionID] = time.Now().Add(1 * time.Minute)
+		sp.sessionUnlockTime[sessionID] = time.Now().Add(sp.unlockDuration)
 
 		// 重置计数器
 		if sp.sessionCounters != nil {
 			sp.sessionCounters[sessionID] = 0
 		}
 
-		// 关闭拦截器，1小时后自动恢复
+		// 关闭拦截器，按配置时长后自动恢复
 		sp.enableInterceptor = false
-		log.Printf("[checkAndUnlockSession] Interceptor disabled, will re-enable after 1 hour")
+		log.Printf("[checkAndUnlockSession] Interceptor disabled, will re-enable after %s", sp.unlockDuration)
 
-		// 启动定时器，1小时后恢复拦截器
+		// 启动定时器，按配置时长后恢复拦截器
 		go func() {
-			<-time.After(1 * time.Minute)
+			<-time.After(sp.unlockDuration)
 			sp.mu.Lock()
 			defer sp.mu.Unlock()
 			sp.enableInterceptor = sp.originalEnableInterceptor
-			log.Printf("[checkAndUnlockSession] Interceptor re-enabled after 1 hour")
+			log.Printf("[checkAndUnlockSession] Interceptor re-enabled after %s", sp.unlockDuration)
 		}()
 
 		return true
@@ -600,9 +621,18 @@ func (sp *SentenceProcessor) checkAndUnlockSession(input string, sessionID strin
 	return false
 }
 
-func (sp *SentenceProcessor) CheckAndUnlockSession(input string) {
-	sessionID := sp.getSessionID()
+func (sp *SentenceProcessor) CheckAndUnlockSession(input string, sessionID string) {
 	sp.checkAndUnlockSession(input, sessionID)
+}
+
+func (sp *SentenceProcessor) SetCurrentSessionID(sessionID string) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if strings.TrimSpace(sessionID) == "" {
+		sp.currentSessionID = "default-session"
+		return
+	}
+	sp.currentSessionID = sessionID
 }
 
 func (sp *SentenceProcessor) simulateStreamOutput(content string, reasoningSentence string, callback func(string)) {
@@ -627,8 +657,10 @@ func (sp *SentenceProcessor) simulateStreamOutput(content string, reasoningSente
 	finishResult := sp.formatAsSSE("", "", "")
 	finishMap := make(map[string]interface{})
 	if err := json.Unmarshal([]byte(finishResult), &finishMap); err == nil {
-		if choices, ok := finishMap["choices"].([]map[string]interface{}); ok && len(choices) > 0 {
-			choices[0]["finish_reason"] = "stop"
+		if choices, ok := finishMap["choices"].([]interface{}); ok && len(choices) > 0 {
+			if firstChoice, ok := choices[0].(map[string]interface{}); ok {
+				firstChoice["finish_reason"] = "stop"
+			}
 		}
 		if jsonData, err := json.Marshal(finishMap); err == nil {
 			callback(string(jsonData))

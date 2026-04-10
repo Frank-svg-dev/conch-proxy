@@ -73,7 +73,7 @@ InterceptStream(c *gin.Context, reader io.Reader, flusher http.Flusher)
 ```
 
 #### 2. SentenceProcessor (句子处理器)
-**文件**: `internal/processor/sentence_processor.go`
+**文件**: `internal/processor/conch-proxy-processor.go`
 
 **职责**:
 - 缓冲流式数据片段
@@ -91,8 +91,8 @@ Flush(callback func(string))
 - 英文句号、问号、感叹号: `[.!?]+\s*$`
 - 中文句号、问号、感叹号: `[。！？]+\s*$`
 
-#### 3. SimpleAgent (简单Agent)
-**文件**: `internal/agent/simple_agent.go`
+#### 3. ProcessingAgent (处理Agent)
+**文件**: `internal/agent/processing_agent.go`
 
 **职责**:
 - 实现Blades Agent接口
@@ -104,20 +104,13 @@ Flush(callback func(string))
 Run(ctx context.Context, invocation *blades.Invocation) blades.Generator[*blades.Message, error]
 ```
 
-#### 4. AgentManager (Agent管理器)
-**文件**: `internal/agent/manager.go`
+#### 4. 路由与中间件
+**文件**: `internal/router/router.go`, `internal/middleware/middleware.go`
 
 **职责**:
-- 管理多个Agent实例
-- 提供Agent注册和查询功能
-- 创建默认Agent
-
-**核心方法**:
-```go
-RegisterAgent(name string, agent blades.Agent)
-GetAgent(name string) (blades.Agent, bool)
-CreateDefaultAgent(openaiKey, openaiURL string) error
-```
+- 统一注册 OpenAI 兼容路由 `/v1/chat/completions`
+- 提供健康检查 `/health`
+- 提供基础日志与 CORS 中间件
 
 ## 工作流程
 
@@ -223,13 +216,7 @@ type Agent interface {
 }
 ```
 
-### 注册自定义Agent
-
-```go
-agentManager := agent.NewAgentManager()
-customAgent := NewCustomAgent(...)
-agentManager.RegisterAgent("custom", customAgent)
-```
+在 `SentenceProcessor` 初始化后可通过 `SetAgent(...)` 注入自定义 Agent。
 
 ## 技术特点
 
